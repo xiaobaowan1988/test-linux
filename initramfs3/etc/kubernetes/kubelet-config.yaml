@@ -1,0 +1,22 @@
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+address: "0.0.0.0"
+port: 10250
+readOnlyPort: 10255
+containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
+cgroupDriver: "cgroupfs"
+cgroupsPerQOS: true
+cpuCFSQuota: false
+staticPodPath: "/etc/kubernetes/manifests"
+clusterDomain: "cluster.local"
+authentication:
+  anonymous:
+    enabled: true
+  webhook:
+    enabled: false
+authorization:
+  mode: AlwaysAllow
+failSwapOn: false
+evictionHard:
+  memory.available: "50Mi"
+  nodefs.available: "5%"

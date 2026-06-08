@@ -1,0 +1,22 @@
+version = 2
+
+[grpc]
+  address = "/run/containerd/containerd.sock"
+
+[debug]
+  level = "warn"
+
+[plugins."io.containerd.snapshotter.v1.overlayfs"]
+  root_path = "/run/containerd/snapshots"
+
+[plugins."io.containerd.grpc.v1.cri"]
+  disable_tcp_service = true
+  stream_server_address = "127.0.0.1"
+  seccomp_profile = ""
+  [plugins."io.containerd.grpc.v1.cri".cni]
+    bin_dir = "/opt/cni/bin"
+    conf_dir = "/etc/cni/net.d"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    runtime_type = "io.containerd.runc.v2"
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+      BinaryName = "/bin/runc"
