@@ -239,6 +239,50 @@ int main(void)
             printf("  [!!] kube-apiserver not ready after 60s\n");
     }
 
+    /* ── kube-controller-manager ────────────────────────── */
+    printf("\n[ kube-controller-manager ]\n");
+    pid_t kcm_pid = fork();
+    if (kcm_pid == 0) {
+        int logfd = open("/tmp/kcm.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        dup2(logfd,1); dup2(logfd,2); close(logfd);
+        execl("/bin/kube-controller-manager","kube-controller-manager",
+              "--kubeconfig",                   "/etc/kubernetes/controller-manager.kubeconfig",
+              "--service-account-private-key-file", "/etc/kubernetes/pki/sa.key",
+              "--root-ca-file",                 "/etc/kubernetes/pki/ca.crt",
+              "--cluster-signing-cert-file",    "/etc/kubernetes/pki/ca.crt",
+              "--cluster-signing-key-file",     "/etc/kubernetes/pki/ca.key",
+              "--bind-address",                 "127.0.0.1",
+              "--leader-elect=false",
+              "--use-service-account-credentials=false",
+              "--controllers=*",
+              "--v=2",
+              NULL);
+        _exit(1);
+    }
+    /* wait up to 20s for controller-manager to start */
+    {
+        int ready = 0;
+        for (int i = 0; i < 200 && !ready; i++) {
+            msleep(100);
+            FILE *f = fopen("/tmp/kcm.log", "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "Starting controller") ||
+                    strstr(line, "Started controller") ||
+                    strstr(line, "Serving securely") ||
+                    strstr(line, "serving securely")) {
+                    ready = 1; break;
+                }
+            }
+            fclose(f);
+        }
+        if (ready)
+            printf("  [ok] kube-controller-manager started (pid=%d)\n", kcm_pid);
+        else
+            printf("  [!!] kube-controller-manager not ready after 20s\n");
+    }
+
     /* ── containerd ──────────────────────────────────────── */
     printf("\n[ containerd ]\n");
     pid_t cd = fork();
@@ -419,8 +463,12 @@ int main(void)
     }
 
     /* kube-apiserver log tail */
-    printf("\n── kube-apiserver log (last 4KB) ────────────────\n");
-    tail_file("/tmp/kube-apiserver.log", 4096);
+    printf("\n── kube-apiserver log (last 2KB) ────────────────\n");
+    tail_file("/tmp/kube-apiserver.log", 2048);
+
+    /* controller-manager log tail */
+    printf("\n── controller-manager log (last 2KB) ────────────\n");
+    tail_file("/tmp/kcm.log", 2048);
 
     /* etcd health check */
     printf("\n── etcd endpoint health ─────────────────────────\n");
