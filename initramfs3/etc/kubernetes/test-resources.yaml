@@ -64,20 +64,25 @@ spec:
           seccompProfile:
             type: Unconfined
 ---
-apiVersion: v1
-kind: PersistentVolume
+# CSI driver registration object
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
 metadata:
-  name: test-pv
+  name: test.csi.k8s.io
 spec:
-  capacity:
-    storage: 100Mi
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: manual
-  persistentVolumeReclaimPolicy: Retain
-  hostPath:
-    path: /tmp/test-pv
+  attachRequired: false
+  podInfoOnMount: false
 ---
+# StorageClass backed by our test CSI driver
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: test-csi
+provisioner: test.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+# PVC that will be dynamically provisioned by test-csi driver
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -89,15 +94,47 @@ spec:
   resources:
     requests:
       storage: 100Mi
-  storageClassName: manual
+  storageClassName: test-csi
 ---
+# Pod that mounts the CSI-provisioned PVC and writes a file to verify volume works
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-consumer
+  namespace: default
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    seccompProfile:
+      type: Unconfined
+  containers:
+  - name: consumer
+    image: docker.io/library/hello:latest
+    command: ["/bin/sleep", "300"]
+    imagePullPolicy: Never
+    securityContext:
+      seccompProfile:
+        type: Unconfined
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: test-pvc
+---
+# IngressClass served by our test-ingress controller
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
 metadata:
   name: test-ingress-class
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "false"
 spec:
-  controller: example.com/test-ingress
+  controller: test.ingress.k8s.io/test-ingress
 ---
+# Ingress routing hello.example.com → hello-svc:80
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

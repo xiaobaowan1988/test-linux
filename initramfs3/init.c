@@ -379,6 +379,43 @@ int main(void)
         printf("  [ok] pause image imported\n");
     }
 
+    /* ── test-csi driver ────────────────────────────────── */
+    printf("\n[ test-csi driver ]\n");
+    mkdir("/var/lib/test-csi-volumes", 0755);
+    mkdir("/var/lib/kubelet/plugins", 0755);
+    mkdir("/var/lib/kubelet/plugins_registry", 0755);
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            int logfd = open("/tmp/test-csi.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+            dup2(logfd,1); dup2(logfd,2); close(logfd);
+            execl("/bin/test-csi","test-csi",NULL);
+            _exit(1);
+        }
+        /* wait for CSI socket to appear (up to 5s) */
+        int ready = 0;
+        for (int i = 0; i < 50 && !ready; i++) {
+            msleep(100);
+            if (access("/var/lib/kubelet/plugins/test.csi.k8s.io/csi.sock", F_OK) == 0)
+                ready = 1;
+        }
+        printf("  [%s] test-csi (pid=%d)\n", ready?"ok":"!!" , p);
+    }
+
+    /* ── test-ingress controller ─────────────────────────── */
+    printf("\n[ test-ingress controller ]\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            int logfd = open("/tmp/test-ingress.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+            dup2(logfd,1); dup2(logfd,2); close(logfd);
+            execl("/bin/test-ingress","test-ingress",NULL);
+            _exit(1);
+        }
+        msleep(500);
+        printf("  [ok] test-ingress started (pid=%d)\n", p);
+    }
+
     /* ── kubelet ─────────────────────────────────────────── */
     printf("\n[ kubelet ]\n");
     /* redirect kubelet logs to file so we can tail them */
@@ -515,9 +552,9 @@ int main(void)
         if (done) { printf("  [ok] hello-deploy pod Running\n"); break; }
     }
 
-    /* wait up to 30s for PVC to be Bound */
-    printf("  waiting up to 30s for PVC Bound...\n");
-    for (int i = 0; i < 300; i++) {
+    /* wait up to 60s for CSI PVC to be Bound */
+    printf("  waiting up to 60s for CSI PVC Bound...\n");
+    for (int i = 0; i < 600; i++) {
         msleep(100);
         FILE *f = popen("kubectl get pvc -A --no-headers 2>/dev/null", "r");
         if (!f) continue;
@@ -528,15 +565,64 @@ int main(void)
         if (done) { printf("  [ok] test-pvc Bound\n"); break; }
     }
 
-    /* ── PV / PVC / Ingress (after create) ───── */
-    kctl("core/v1 » persistentvolumes (after create)", (const char*[]){
+    /* wait up to 60s for csi-consumer pod to be Running */
+    printf("  waiting up to 60s for csi-consumer pod Running...\n");
+    for (int i = 0; i < 600; i++) {
+        msleep(100);
+        FILE *f = popen("kubectl get pods -A --no-headers 2>/dev/null", "r");
+        if (!f) continue;
+        char line[256]; int done = 0;
+        while (fgets(line, sizeof line, f))
+            if (strstr(line,"csi-consumer") && strstr(line,"Running")) { done=1; break; }
+        pclose(f);
+        if (done) { printf("  [ok] csi-consumer Running\n"); break; }
+    }
+
+    /* ── CSI / Storage / Ingress resources (after create) ── */
+    kctl("storage » csidrivers", (const char*[]){
+        "kubectl","get","csidrivers",NULL});
+    kctl("storage » csinodes", (const char*[]){
+        "kubectl","get","csinodes",NULL});
+    kctl("storage » storageclasses", (const char*[]){
+        "kubectl","get","storageclasses",NULL});
+    kctl("core/v1 » persistentvolumes (CSI)", (const char*[]){
         "kubectl","get","persistentvolumes","-o","wide",NULL});
-    kctl("core/v1 » persistentvolumeclaims (after create)", (const char*[]){
+    kctl("core/v1 » persistentvolumeclaims (CSI)", (const char*[]){
         "kubectl","get","persistentvolumeclaims","-A","-o","wide",NULL});
-    kctl("networking » ingressclasses (after create)", (const char*[]){
+    kctl("networking » ingressclasses", (const char*[]){
         "kubectl","get","ingressclasses",NULL});
-    kctl("networking » ingresses (after create)", (const char*[]){
+    kctl("networking » ingresses", (const char*[]){
         "kubectl","get","ingresses","-A",NULL});
+
+    /* test ingress routing: httpget hello.example.com via ingress controller on :80 */
+    printf("\n── ingress HTTP test (httpget) ──────────────────────\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            execl("/bin/httpget","httpget",
+                  "http://127.0.0.1/","hello.example.com",NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+    }
+
+    /* verify CSI volume directories were created */
+    printf("\n── CSI volume directories ───────────────────────────\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            execl("/bin/find","find","/var/lib/test-csi-volumes",
+                  "-maxdepth","2","-ls",NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+    }
+
+    /* tail test-csi and test-ingress logs */
+    printf("\n── test-csi log (last 2KB) ──────────────────────────\n");
+    tail_file("/tmp/test-csi.log", 2048);
+    printf("\n── test-ingress log (last 2KB) ──────────────────────\n");
+    tail_file("/tmp/test-ingress.log", 2048);
 
     /* ── apps/v1 ─────────────────────────────── */
     kctl("apps/v1 » deployments -A", (const char*[]){

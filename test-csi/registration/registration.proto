@@ -1,0 +1,20 @@
+syntax = "proto3";
+package pluginregistration;
+option go_package = "test-csi/registration";
+
+service Registration {
+  rpc GetInfo(InfoRequest) returns (PluginInfo) {}
+  rpc NotifyRegistrationStatus(RegistrationStatus) returns (RegistrationStatusResponse) {}
+}
+message InfoRequest {}
+message PluginInfo {
+  string type              = 1;
+  string name              = 2;
+  string endpoint          = 3;
+  repeated string supported_versions = 4;
+}
+message RegistrationStatus {
+  bool   plugin_registered = 1;
+  string error             = 2;
+}
+message RegistrationStatusResponse {}
