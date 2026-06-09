@@ -57,8 +57,8 @@ spec:
           type: Unconfined
       containers:
       - name: hello
-        image: docker.io/library/hello:latest
-        command: ["/bin/sleep", "300"]
+        image: docker.io/library/hello-http:latest
+        command: ["/bin/hello-http"]
         imagePullPolicy: Never
         securityContext:
           seccompProfile:

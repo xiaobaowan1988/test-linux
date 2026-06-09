@@ -15,6 +15,7 @@
 #include <sys/reboot.h>
 #include <sys/utsname.h>
 #include <net/if.h>
+#include <net/route.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -82,6 +83,32 @@ static void setup_lo(void) {
     ifr.ifr_flags = IFF_UP|IFF_LOOPBACK|IFF_RUNNING;
     ioctl(s, SIOCSIFFLAGS, &ifr); close(s);
     printf("  [ok] lo 127.0.0.1/8\n");
+}
+
+/* Add a UNICAST route for the service CIDR (10.96.0.0/12) via lo.
+ * Without this route, connect() to ClusterIPs fails with ENETUNREACH
+ * before iptables OUTPUT can DNAT the packet to a pod IP. */
+static void add_svc_route(void) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { printf("  [!!] svc route: socket: %s\n", strerror(errno)); return; }
+    struct rtentry rt;
+    memset(&rt, 0, sizeof rt);
+    struct sockaddr_in *dst  = (struct sockaddr_in *)&rt.rt_dst;
+    struct sockaddr_in *mask = (struct sockaddr_in *)&rt.rt_genmask;
+    struct sockaddr_in *gw   = (struct sockaddr_in *)&rt.rt_gateway;
+    dst->sin_family  = AF_INET;
+    dst->sin_addr.s_addr = inet_addr("10.96.0.0");
+    mask->sin_family = AF_INET;
+    mask->sin_addr.s_addr = inet_addr("255.240.0.0"); /* /12 */
+    gw->sin_family   = AF_INET;
+    gw->sin_addr.s_addr = INADDR_ANY;
+    rt.rt_flags = RTF_UP;
+    rt.rt_dev   = (char *)"lo";
+    if (ioctl(s, SIOCADDRT, &rt) < 0)
+        printf("  [!!] svc route SIOCADDRT: %s\n", strerror(errno));
+    else
+        printf("  [ok] service CIDR route 10.96.0.0/12 → lo\n");
+    close(s);
 }
 
 /* tail last N bytes of a file to stdout */
@@ -156,6 +183,7 @@ int main(void)
     mkdir("/run/netns", 0755);
 
     setup_lo();
+    add_svc_route();
     sethostname("test-node", 9);
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin", 1);
 
@@ -363,6 +391,22 @@ int main(void)
         printf("  [ok] hello image imported\n");
     }
 
+    /* pre-import hello-http image (HTTP server for ingress test) */
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            int nul=open("/dev/null",O_WRONLY); dup2(nul,1); dup2(nul,2);
+            execl("/bin/ctr","ctr",
+                  "--address","/run/containerd/containerd.sock",
+                  "--namespace","k8s.io",
+                  "images","import","/hello-http.oci.tar",
+                  "--index-name","docker.io/library/hello-http:latest", NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+        printf("  [ok] hello-http image imported\n");
+    }
+
     /* pre-import pause image (kubelet sandbox) into k8s.io namespace */
     {
         pid_t p = fork();
@@ -377,6 +421,40 @@ int main(void)
         }
         int st; waitpid(p, &st, 0);
         printf("  [ok] pause image imported\n");
+    }
+
+    /* ── kube-proxy ─────────────────────────────────────── */
+    printf("\n[ kube-proxy ]\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            int logfd = open("/tmp/kube-proxy.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+            dup2(logfd,1); dup2(logfd,2); close(logfd);
+            execl("/bin/kube-proxy","kube-proxy",
+                  "--kubeconfig",  "/etc/kubernetes/kube-proxy.kubeconfig",
+                  "--proxy-mode",  "iptables",
+                  "--cluster-cidr","10.88.0.0/16",
+                  "--v=2",
+                  NULL);
+            _exit(1);
+        }
+        /* wait up to 10s for kube-proxy to set up KUBE-SERVICES chain */
+        int ready = 0;
+        for (int i = 0; i < 100 && !ready; i++) {
+            msleep(100);
+            FILE *f = fopen("/tmp/kube-proxy.log", "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "Syncing iptables rules") ||
+                    strstr(line, "syncProxyRules took") ||
+                    strstr(line, "Tearing down inactive")) {
+                    ready = 1; break;
+                }
+            }
+            fclose(f);
+        }
+        printf("  [%s] kube-proxy (pid=%d)\n", ready?"ok":"!!", p);
     }
 
     /* ── test-csi driver ────────────────────────────────── */
@@ -549,7 +627,26 @@ int main(void)
         while (fgets(line, sizeof line, f))
             if (strstr(line,"hello-deploy") && strstr(line,"Running")) { done=1; break; }
         pclose(f);
-        if (done) { printf("  [ok] hello-deploy pod Running\n"); break; }
+        if (done) {
+            printf("  [ok] hello-deploy pod Running\n");
+            /* wait up to 30s for hello-svc endpoint to be populated */
+            printf("  waiting for hello-svc endpoint (kube-proxy sync)...\n");
+            for (int ep = 0; ep < 150; ep++) {
+                msleep(200);
+                FILE *ef = popen("kubectl get endpoints hello-svc --no-headers 2>/dev/null", "r");
+                if (!ef) continue;
+                char el[256]; int ep_ok = 0;
+                while (fgets(el, sizeof el, ef))
+                    if (strstr(el,"hello-svc") && !strstr(el,"<none>")) { ep_ok=1; break; }
+                pclose(ef);
+                if (ep_ok) {
+                    printf("  [ok] hello-svc endpoint populated, sleeping 5s for kube-proxy iptables sync\n");
+                    msleep(5000);
+                    break;
+                }
+            }
+            break;
+        }
     }
 
     /* wait up to 60s for CSI PVC to be Bound */
@@ -594,16 +691,74 @@ int main(void)
     kctl("networking » ingresses", (const char*[]){
         "kubectl","get","ingresses","-A",NULL});
 
-    /* test ingress routing: httpget hello.example.com via ingress controller on :80 */
-    printf("\n── ingress HTTP test (httpget) ──────────────────────\n");
+    /* dump iptables OUTPUT chain — needed for locally-originated ClusterIP traffic */
+    printf("\n── iptables nat OUTPUT chain ────────────────────────\n");
     {
         pid_t p = fork();
         if (p == 0) {
-            execl("/bin/httpget","httpget",
-                  "http://127.0.0.1/","hello.example.com",NULL);
+            execl("/bin/iptables","iptables","-t","nat","-L","OUTPUT",
+                  "--line-numbers","-n",NULL);
             _exit(1);
         }
         int st; waitpid(p, &st, 0);
+    }
+
+    /* dump full iptables nat rules (-S = save format) */
+    printf("\n── iptables nat rules (-S) ──────────────────────────\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            execl("/bin/iptables","iptables","-t","nat","-S",NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+    }
+
+    /* direct pod IP test: bypass ClusterIP and test hello-http pod directly */
+    printf("\n── direct pod HTTP test (pod IP:8080) ───────────────\n");
+    {
+        /* get hello-deploy pod IP via kubectl */
+        char podip[64] = {0};
+        FILE *f = popen(
+            "kubectl get pods -n default --no-headers -l app=hello-deploy "
+            "-o custom-columns=IP:.status.podIP 2>/dev/null | grep -v IP | head -1",
+            "r");
+        if (f) { fgets(podip, sizeof podip, f); pclose(f); }
+        /* strip newline */
+        for (int i = 0; podip[i]; i++) if (podip[i]=='\n'||podip[i]=='\r') { podip[i]=0; break; }
+        if (podip[0] && strcmp(podip,"<none>") != 0) {
+            printf("  pod IP: %s — testing http://%s:8080/\n", podip, podip);
+            char url[128];
+            snprintf(url, sizeof url, "http://%s:8080/", podip);
+            pid_t p = fork();
+            if (p == 0) {
+                execl("/bin/httpget","httpget",url,podip,NULL);
+                _exit(1);
+            }
+            int st; waitpid(p, &st, 0);
+        } else {
+            printf("  (could not get pod IP: '%s')\n", podip);
+        }
+    }
+
+    /* test ingress routing: httpget hello.example.com via ingress controller on :80 */
+    printf("\n── ingress HTTP test (httpget, up to 3 attempts) ────\n");
+    {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            printf("  attempt %d:\n", attempt);
+            pid_t p = fork();
+            if (p == 0) {
+                execl("/bin/httpget","httpget",
+                      "http://127.0.0.1/","hello.example.com",NULL);
+                _exit(1);
+            }
+            int st; waitpid(p, &st, 0);
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+                printf("  [ok] ingress HTTP test passed\n");
+                break;
+            }
+            if (attempt < 3) { printf("  retry in 3s...\n"); msleep(3000); }
+        }
     }
 
     /* verify CSI volume directories were created */
@@ -618,11 +773,25 @@ int main(void)
         int st; waitpid(p, &st, 0);
     }
 
+    /* kube-proxy iptables rules (KUBE-SERVICES chain) */
+    printf("\n── kube-proxy iptables NAT rules ────────────────────\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            execl("/bin/iptables","iptables","-t","nat","-L","KUBE-SERVICES",
+                  "--line-numbers","-n",NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+    }
+
     /* tail test-csi and test-ingress logs */
     printf("\n── test-csi log (last 2KB) ──────────────────────────\n");
     tail_file("/tmp/test-csi.log", 2048);
     printf("\n── test-ingress log (last 2KB) ──────────────────────\n");
     tail_file("/tmp/test-ingress.log", 2048);
+    printf("\n── kube-proxy log (last 2KB) ────────────────────────\n");
+    tail_file("/tmp/kube-proxy.log", 2048);
 
     /* ── apps/v1 ─────────────────────────────── */
     kctl("apps/v1 » deployments -A", (const char*[]){

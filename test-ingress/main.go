@@ -2,11 +2,9 @@
 //
 // Listens on :80. On each request:
 //   1. Match Host + path prefix against current Ingress rules.
-//   2. Look up Endpoints for the target Service (bypasses kube-proxy since we
-//      have no kube-proxy running; ClusterIP is not routable).
-//   3. Forward to the first ready endpoint address:port.
+//   2. Look up Service ClusterIP:port — kube-proxy handles the DNAT to pod IPs.
 //
-// Watches /apis/networking.k8s.io/v1/ingresses and /api/v1/endpoints from the
+// Watches /apis/networking.k8s.io/v1/ingresses and /api/v1/services from the
 // kube-apiserver using a polling loop (every 5s).
 
 package main
@@ -49,8 +47,8 @@ type Ingress struct {
 }
 
 type IngressRule struct {
-	Host string      `json:"host"`
-	HTTP *HTTPPaths  `json:"http"`
+	Host string     `json:"host"`
+	HTTP *HTTPPaths `json:"http"`
 }
 
 type HTTPPaths struct {
@@ -70,23 +68,21 @@ type HTTPPath struct {
 	} `json:"backend"`
 }
 
-type EndpointsList struct {
-	Items []Endpoints `json:"items"`
+type ServiceList struct {
+	Items []Service `json:"items"`
 }
 
-type Endpoints struct {
+type Service struct {
 	Metadata struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
 	} `json:"metadata"`
-	Subsets []struct {
-		Addresses []struct {
-			IP string `json:"ip"`
-		} `json:"addresses"`
-		Ports []struct {
+	Spec struct {
+		ClusterIP string `json:"clusterIP"`
+		Ports     []struct {
 			Port int `json:"port"`
 		} `json:"ports"`
-	} `json:"subsets"`
+	} `json:"spec"`
 }
 
 // ── Route table ───────────────────────────────────────────────────────────────
@@ -94,20 +90,20 @@ type Endpoints struct {
 type route struct {
 	host      string
 	path      string
-	pathType  string // Prefix | Exact | ImplementationSpecific
+	pathType  string
 	svcName   string
 	svcPort   int
 	namespace string
 }
 
 type routeTable struct {
-	mu        sync.RWMutex
-	routes    []route
-	endpoints map[string][]string // "ns/svcName:port" → ["ip:port", ...]
+	mu       sync.RWMutex
+	routes   []route
+	clusterIPs map[string]string // "ns/name:port" → "clusterIP:port"
 }
 
 var table = &routeTable{
-	endpoints: make(map[string][]string),
+	clusterIPs: make(map[string]string),
 }
 
 // ── API client ────────────────────────────────────────────────────────────────
@@ -173,38 +169,40 @@ func refresh() {
 		}
 	}
 
-	// Fetch all Endpoints
-	data, err = apiGet("/api/v1/endpoints")
+	// Fetch all Services → build ClusterIP map
+	data, err = apiGet("/api/v1/services")
 	if err != nil {
-		log.Printf("fetch endpoints: %v", err)
+		log.Printf("fetch services: %v", err)
 		return
 	}
-	var epList EndpointsList
-	if err := json.Unmarshal(data, &epList); err != nil {
+	var svcList ServiceList
+	if err := json.Unmarshal(data, &svcList); err != nil {
 		return
 	}
 
-	newEP := make(map[string][]string)
-	for _, ep := range epList.Items {
-		for _, sub := range ep.Subsets {
-			for _, addr := range sub.Addresses {
-				for _, port := range sub.Ports {
-					key := fmt.Sprintf("%s/%s:%d", ep.Metadata.Namespace, ep.Metadata.Name, port.Port)
-					newEP[key] = append(newEP[key], fmt.Sprintf("%s:%d", addr.IP, port.Port))
-				}
-			}
+	newCIPs := make(map[string]string)
+	for _, svc := range svcList.Items {
+		if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+			continue
+		}
+		for _, p := range svc.Spec.Ports {
+			key := fmt.Sprintf("%s/%s:%d", svc.Metadata.Namespace, svc.Metadata.Name, p.Port)
+			newCIPs[key] = fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, p.Port)
 		}
 	}
 
 	table.mu.Lock()
 	table.routes = newRoutes
-	table.endpoints = newEP
+	table.clusterIPs = newCIPs
 	table.mu.Unlock()
 
 	if len(newRoutes) > 0 {
-		log.Printf("routes refreshed: %d ingress rules, %d endpoint sets", len(newRoutes), len(newEP))
+		log.Printf("routes refreshed: %d ingress rules, %d services with ClusterIP",
+			len(newRoutes), len(newCIPs))
 		for _, r := range newRoutes {
-			log.Printf("  %s%s → %s/%s:%d", r.host, r.path, r.namespace, r.svcName, r.svcPort)
+			key := fmt.Sprintf("%s/%s:%d", r.namespace, r.svcName, r.svcPort)
+			cip := newCIPs[key]
+			log.Printf("  %s%s → %s (ClusterIP→%s)", r.host, r.path, key, cip)
 		}
 	}
 }
@@ -218,7 +216,7 @@ func match(r route, host, path string) bool {
 	switch r.pathType {
 	case "Exact":
 		return path == r.path
-	default: // Prefix or ImplementationSpecific
+	default:
 		return strings.HasPrefix(path, r.path)
 	}
 }
@@ -238,42 +236,40 @@ func handler(w http.ResponseWriter, req *http.Request) {
 			break
 		}
 	}
-	var targets []string
+	var target string
 	if matched != nil {
 		key := fmt.Sprintf("%s/%s:%d", matched.namespace, matched.svcName, matched.svcPort)
-		targets = table.endpoints[key]
+		target = table.clusterIPs[key]
 	}
 	table.mu.RUnlock()
 
 	if matched == nil {
 		http.Error(w, "no matching ingress rule", http.StatusNotFound)
-		log.Printf("no route for host=%s path=%s", host, path)
+		log.Printf("no route: host=%s path=%s", host, path)
 		return
 	}
-	if len(targets) == 0 {
-		http.Error(w, "no endpoints for "+matched.svcName, http.StatusBadGateway)
-		log.Printf("no endpoints for %s/%s", matched.namespace, matched.svcName)
+	if target == "" {
+		http.Error(w, "no ClusterIP for "+matched.svcName, http.StatusBadGateway)
+		log.Printf("no ClusterIP for %s/%s", matched.namespace, matched.svcName)
 		return
 	}
 
-	target := targets[0]
 	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
 		Scheme: "http",
 		Host:   target,
 	})
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("proxy error %s: %v", target, err)
+		log.Printf("proxy error %s→%s: %v", host+path, target, err)
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 	}
-	log.Printf("proxy %s%s → %s", host, path, target)
+	log.Printf("proxy %s%s → ClusterIP %s (via kube-proxy)", host, path, target)
 	proxy.ServeHTTP(w, req)
 }
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
-	log.Printf("test-ingress controller starting, listen=%s", listenAddr)
+	log.Printf("test-ingress controller starting, listen=%s (ClusterIP mode via kube-proxy)", listenAddr)
 
-	// Wait for apiserver to be reachable
 	for i := 0; i < 30; i++ {
 		if _, err := apiGet("/healthz"); err == nil {
 			break
@@ -283,7 +279,6 @@ func main() {
 
 	go watchLoop()
 
-	// Announce where we're listening
 	hostname, _ := os.Hostname()
 	log.Printf("ingress controller ready on %s%s", hostname, listenAddr)
 
