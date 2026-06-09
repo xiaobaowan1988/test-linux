@@ -283,6 +283,43 @@ int main(void)
             printf("  [!!] kube-controller-manager not ready after 20s\n");
     }
 
+    /* ── kube-scheduler ─────────────────────────────────── */
+    printf("\n[ kube-scheduler ]\n");
+    pid_t ks_pid = fork();
+    if (ks_pid == 0) {
+        int logfd = open("/tmp/ks.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        dup2(logfd,1); dup2(logfd,2); close(logfd);
+        execl("/bin/kube-scheduler","kube-scheduler",
+              "--kubeconfig",    "/etc/kubernetes/scheduler.kubeconfig",
+              "--bind-address",  "127.0.0.1",
+              "--leader-elect=false",
+              "--v=2",
+              NULL);
+        _exit(1);
+    }
+    {
+        int ready = 0;
+        for (int i = 0; i < 150 && !ready; i++) {
+            msleep(100);
+            FILE *f = fopen("/tmp/ks.log", "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "Serving securely") ||
+                    strstr(line, "serving securely") ||
+                    strstr(line, "Starting Scheduler") ||
+                    strstr(line, "starting scheduler")) {
+                    ready = 1; break;
+                }
+            }
+            fclose(f);
+        }
+        if (ready)
+            printf("  [ok] kube-scheduler started (pid=%d)\n", ks_pid);
+        else
+            printf("  [!!] kube-scheduler not ready after 15s\n");
+    }
+
     /* ── containerd ──────────────────────────────────────── */
     printf("\n[ containerd ]\n");
     pid_t cd = fork();
@@ -469,6 +506,10 @@ int main(void)
     /* controller-manager log tail */
     printf("\n── controller-manager log (last 2KB) ────────────\n");
     tail_file("/tmp/kcm.log", 2048);
+
+    /* scheduler log tail */
+    printf("\n── scheduler log (last 2KB) ─────────────────────\n");
+    tail_file("/tmp/ks.log", 2048);
 
     /* etcd health check */
     printf("\n── etcd endpoint health ─────────────────────────\n");
