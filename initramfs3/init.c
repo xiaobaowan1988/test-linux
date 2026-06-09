@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/reboot.h>
+#include <sys/utsname.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -103,7 +104,7 @@ int main(void)
     printf("\n");
     printf("╔══════════════════════════════════════════════╗\n");
     printf("║   kubelet v1.31  Test on arm64 Linux         ║\n");
-    printf("║   Linux 7.1-rc7  containerd 1.7.25  etcd     ║\n");
+    printf("║   Linux 7.1-rc7  containerd 1.7.25  etcd kube║\n");
     printf("╚══════════════════════════════════════════════╝\n\n");
 
     /* ── system setup ─────────────────────────────────────── */
@@ -143,6 +144,7 @@ int main(void)
     mkdir("/run/netns", 0755);
 
     setup_lo();
+    sethostname("test-node", 9);
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin", 1);
 
     /* ── etcd ────────────────────────────────────────────── */
@@ -185,6 +187,56 @@ int main(void)
             printf("  [ok] etcd ready (pid=%d)\n", etcd_pid);
         else
             printf("  [!!] etcd not ready after 15s\n");
+    }
+
+    /* ── kube-apiserver ─────────────────────────────────── */
+    printf("\n[ kube-apiserver ]\n");
+    pid_t kas_pid = fork();
+    if (kas_pid == 0) {
+        int logfd = open("/tmp/kube-apiserver.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        dup2(logfd,1); dup2(logfd,2); close(logfd);
+        execl("/bin/kube-apiserver","kube-apiserver",
+              "--etcd-servers",              "http://127.0.0.1:2379",
+              "--advertise-address",         "127.0.0.1",
+              "--bind-address",              "127.0.0.1",
+              "--service-cluster-ip-range",  "10.96.0.0/12",
+              "--tls-cert-file",             "/etc/kubernetes/pki/apiserver.crt",
+              "--tls-private-key-file",      "/etc/kubernetes/pki/apiserver.key",
+              "--client-ca-file",            "/etc/kubernetes/pki/ca.crt",
+              "--service-account-key-file",  "/etc/kubernetes/pki/sa.pub",
+              "--service-account-signing-key-file", "/etc/kubernetes/pki/sa.key",
+              "--service-account-issuer",    "https://kubernetes.default.svc.cluster.local",
+              "--token-auth-file",           "/etc/kubernetes/token.csv",
+              "--authorization-mode",        "AlwaysAllow",
+              "--anonymous-auth=true",
+              "--allow-privileged=true",
+              "--v=2",
+              NULL);
+        _exit(1);
+    }
+    /* wait up to 30s for kube-apiserver to be ready */
+    {
+        int ready = 0;
+        for (int i = 0; i < 600 && !ready; i++) {
+            msleep(100);
+            FILE *f = fopen("/tmp/kube-apiserver.log", "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "Serving securely") ||
+                    strstr(line, "serving securely") ||
+                    strstr(line, "insecurely on") ||
+                    strstr(line, "secure serving") ||
+                    strstr(line, "READY")) {
+                    ready = 1; break;
+                }
+            }
+            fclose(f);
+        }
+        if (ready)
+            printf("  [ok] kube-apiserver ready (pid=%d)\n", kas_pid);
+        else
+            printf("  [!!] kube-apiserver not ready after 60s\n");
     }
 
     /* ── containerd ──────────────────────────────────────── */
@@ -257,6 +309,7 @@ int main(void)
         dup2(logfd,1); dup2(logfd,2); close(logfd);
         execl("/bin/kubelet","kubelet",
               "--config",            "/etc/kubernetes/kubelet-config.yaml",
+              "--kubeconfig",        "/etc/kubernetes/kubelet.kubeconfig",
               "--root-dir",          "/var/lib/kubelet",
               "--hostname-override", "test-node",
               "--v=4",
@@ -364,6 +417,10 @@ int main(void)
         }
         int st; waitpid(p, &st, 0);
     }
+
+    /* kube-apiserver log tail */
+    printf("\n── kube-apiserver log (last 4KB) ────────────────\n");
+    tail_file("/tmp/kube-apiserver.log", 4096);
 
     /* etcd health check */
     printf("\n── etcd endpoint health ─────────────────────────\n");

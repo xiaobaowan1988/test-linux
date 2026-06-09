@@ -1,0 +1,1 @@
+kubelet-static-token,kubelet,kubelet,system:masters
