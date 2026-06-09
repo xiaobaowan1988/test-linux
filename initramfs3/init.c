@@ -103,7 +103,7 @@ int main(void)
     printf("\n");
     printf("╔══════════════════════════════════════════════╗\n");
     printf("║   kubelet v1.31  Test on arm64 Linux         ║\n");
-    printf("║   Linux 7.1-rc7  containerd 1.7.25           ║\n");
+    printf("║   Linux 7.1-rc7  containerd 1.7.25  etcd     ║\n");
     printf("╚══════════════════════════════════════════════╝\n\n");
 
     /* ── system setup ─────────────────────────────────────── */
@@ -133,6 +133,7 @@ int main(void)
     }
     mkdir("/run/containerd", 0755);
     mkdir("/var", 0755); mkdir("/var/lib", 0755);
+    mkdir("/var/lib/etcd", 0755);
     mkdir("/var/lib/kubelet", 0755);
     mkdir("/var/lib/kubelet/pods", 0755);
     mkdir("/var/log", 0755);
@@ -143,6 +144,48 @@ int main(void)
 
     setup_lo();
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin", 1);
+
+    /* ── etcd ────────────────────────────────────────────── */
+    printf("\n[ etcd ]\n");
+    pid_t etcd_pid = fork();
+    if (etcd_pid == 0) {
+        int logfd = open("/tmp/etcd.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        dup2(logfd,1); dup2(logfd,2); close(logfd);
+        execl("/bin/etcd","etcd",
+              "--data-dir",              "/var/lib/etcd",
+              "--listen-client-urls",    "http://127.0.0.1:2379",
+              "--advertise-client-urls", "http://127.0.0.1:2379",
+              "--listen-peer-urls",      "http://127.0.0.1:2380",
+              "--initial-advertise-peer-urls", "http://127.0.0.1:2380",
+              "--initial-cluster",       "default=http://127.0.0.1:2380",
+              "--initial-cluster-state", "new",
+              "--initial-cluster-token", "etcd-cluster-1",
+              "--name",                  "default",
+              NULL);
+        _exit(1);
+    }
+    /* wait for etcd to become ready (up to 15s) */
+    {
+        int ready = 0;
+        for (int i = 0; i < 150 && !ready; i++) {
+            msleep(100);
+            FILE *f = fopen("/tmp/etcd.log", "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "serving client traffic") ||
+                    strstr(line, "ready to serve client requests") ||
+                    strstr(line, "serving insecure client requests")) {
+                    ready = 1; break;
+                }
+            }
+            fclose(f);
+        }
+        if (ready)
+            printf("  [ok] etcd ready (pid=%d)\n", etcd_pid);
+        else
+            printf("  [!!] etcd not ready after 15s\n");
+    }
 
     /* ── containerd ──────────────────────────────────────── */
     printf("\n[ containerd ]\n");
@@ -321,6 +364,21 @@ int main(void)
         }
         int st; waitpid(p, &st, 0);
     }
+
+    /* etcd health check */
+    printf("\n── etcd endpoint health ─────────────────────────\n");
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            execl("/bin/etcdctl","etcdctl",
+                  "--endpoints","http://127.0.0.1:2379",
+                  "endpoint","health", NULL);
+            _exit(1);
+        }
+        int st; waitpid(p, &st, 0);
+    }
+    printf("\n── etcd log (last 2KB) ──────────────────────────\n");
+    tail_file("/tmp/etcd.log", 2048);
 
     printf("\n=== Done. Powering off. ===\n\n");
     sync();
