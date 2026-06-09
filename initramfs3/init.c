@@ -111,6 +111,124 @@ static void add_svc_route(void) {
     close(s);
 }
 
+/* print up to max_lines lines of a file */
+static void head_file(const char *path, int max_lines) {
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("  (cannot open %s)\n", path); return; }
+    char line[512]; int n = 0;
+    while (n < max_lines && fgets(line, sizeof line, f))
+        { fputs(line, stdout); n++; }
+    int total = n;
+    while (fgets(line, sizeof line, f)) total++;
+    if (total > max_lines)
+        printf("  ... (%d more lines)\n", total - max_lines);
+    fclose(f);
+}
+
+/* cat an entire small /proc file */
+static void cat_proc(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { printf("  (not available)\n"); return; }
+    char buf[4096]; int n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) fwrite(buf, 1, n, stdout);
+    close(fd);
+}
+
+/* dump /proc/<pid> accounting info — the kernel's open book on a task */
+static void proc_account(pid_t pid, const char *name) {
+    char path[128];
+
+    printf("\n╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  /proc/%d  (%s) — kernel 进程账本              \n", pid, name);
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+
+    /* ── 1. status: human-readable task_struct fields ─────────── */
+    printf("\n┌─ /proc/%d/status  (task_struct 摘要) ─────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    cat_proc(path);
+
+    /* ── 2. cmdline: argv[] as stored in mm->arg_start..arg_end ─ */
+    printf("\n┌─ /proc/%d/cmdline  (完整命令行 argv[]) ────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
+    {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[2048]; int n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) {
+                /* NUL-separated args → space-separated for readability */
+                for (int i = 0; i < n; i++)
+                    putchar(buf[i] == '\0' ? ' ' : buf[i]);
+                putchar('\n');
+            }
+        } else printf("  (not available)\n");
+    }
+
+    /* ── 3. stat: raw task_struct fields (scheduler view) ──────── */
+    printf("\n┌─ /proc/%d/stat  (调度器原始字段) ──────────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    cat_proc(path);
+
+    /* ── 4. statm: memory counters in pages ─────────────────────── */
+    printf("\n┌─ /proc/%d/statm  (内存页计数: size rss shared text lib data dt) ┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/statm", pid);
+    cat_proc(path);
+
+    /* ── 5. wchan: kernel symbol the task is sleeping in ────────── */
+    printf("\n┌─ /proc/%d/wchan  (阻塞在哪个内核函数) ────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/wchan", pid);
+    cat_proc(path);
+    putchar('\n');
+
+    /* ── 6. schedstat: total run-time & wait-time (ns) ──────────── */
+    printf("\n┌─ /proc/%d/schedstat  (运行时间ns / 等待时间ns / 调度次数) ┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/schedstat", pid);
+    cat_proc(path);
+
+    /* ── 7. oom_score + oom_score_adj ─────────────────────────── */
+    printf("\n┌─ /proc/%d/oom_score  (OOM killer 分值) ─────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/oom_score", pid);
+    cat_proc(path);
+    printf("┌─ /proc/%d/oom_score_adj  (用户态调整值) ────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/oom_score_adj", pid);
+    cat_proc(path);
+
+    /* ── 8. limits: rlimit table ─────────────────────────────── */
+    printf("\n┌─ /proc/%d/limits  (资源上限 rlimit 表) ─────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/limits", pid);
+    cat_proc(path);
+
+    /* ── 9. io: read/write byte accounting ───────────────────── */
+    printf("\n┌─ /proc/%d/io  (I/O 账单: rchar/wchar/syscr/syscw/...) ┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/io", pid);
+    cat_proc(path);
+
+    /* ── 10. cgroup: which cgroup hierarchy the task belongs to ── */
+    printf("\n┌─ /proc/%d/cgroup  (所属 cgroup 层级) ──────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/cgroup", pid);
+    cat_proc(path);
+
+    /* ── 11. fd: count open file descriptors ─────────────────── */
+    printf("\n┌─ /proc/%d/fd/  (打开的文件描述符) ─────────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/fd", pid);
+    {
+        DIR *d = opendir(path);
+        if (d) {
+            int cnt = 0; struct dirent *e;
+            while ((e = readdir(d))) if (e->d_name[0] != '.') cnt++;
+            closedir(d);
+            printf("  共 %d 个打开的 fd\n", cnt);
+        } else printf("  (cannot open)\n");
+    }
+
+    /* ── 12. maps: first 20 lines of address space map ────────── */
+    printf("\n┌─ /proc/%d/maps  (虚拟地址空间前20条) ──────────────────┐\n", pid);
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
+    head_file(path, 20);
+
+    printf("\n── end of /proc/%d ──────────────────────────────────────\n\n", pid);
+}
+
 /* tail last N bytes of a file to stdout */
 static void tail_file(const char *path, int nbytes) {
     int fd = open(path, O_RDONLY);
@@ -1019,6 +1137,9 @@ int main(void)
     }
     printf("\n── etcd log (last 2KB) ──────────────────────────\n");
     tail_file("/tmp/etcd.log", 2048);
+
+    /* ── /proc 进程账本 ──────────────────────────────────────── */
+    proc_account(kl, "kubelet");
 
     printf("\n=== Done. Powering off. ===\n\n");
     sync();
