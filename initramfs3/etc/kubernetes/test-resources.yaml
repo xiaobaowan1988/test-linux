@@ -64,6 +64,59 @@ spec:
           seccompProfile:
             type: Unconfined
 ---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-pv
+spec:
+  capacity:
+    storage: 100Mi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /tmp/test-pv
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+  storageClassName: manual
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: test-ingress-class
+spec:
+  controller: example.com/test-ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+  namespace: default
+spec:
+  ingressClassName: test-ingress-class
+  rules:
+  - host: hello.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hello-svc
+            port:
+              number: 80
+---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

@@ -515,6 +515,29 @@ int main(void)
         if (done) { printf("  [ok] hello-deploy pod Running\n"); break; }
     }
 
+    /* wait up to 30s for PVC to be Bound */
+    printf("  waiting up to 30s for PVC Bound...\n");
+    for (int i = 0; i < 300; i++) {
+        msleep(100);
+        FILE *f = popen("kubectl get pvc -A --no-headers 2>/dev/null", "r");
+        if (!f) continue;
+        char line[256]; int done = 0;
+        while (fgets(line, sizeof line, f))
+            if (strstr(line,"test-pvc") && strstr(line,"Bound")) { done=1; break; }
+        pclose(f);
+        if (done) { printf("  [ok] test-pvc Bound\n"); break; }
+    }
+
+    /* ── PV / PVC / Ingress (after create) ───── */
+    kctl("core/v1 » persistentvolumes (after create)", (const char*[]){
+        "kubectl","get","persistentvolumes","-o","wide",NULL});
+    kctl("core/v1 » persistentvolumeclaims (after create)", (const char*[]){
+        "kubectl","get","persistentvolumeclaims","-A","-o","wide",NULL});
+    kctl("networking » ingressclasses (after create)", (const char*[]){
+        "kubectl","get","ingressclasses",NULL});
+    kctl("networking » ingresses (after create)", (const char*[]){
+        "kubectl","get","ingresses","-A",NULL});
+
     /* ── apps/v1 ─────────────────────────────── */
     kctl("apps/v1 » deployments -A", (const char*[]){
         "kubectl","get","deployments","-A","-o","wide",NULL});
