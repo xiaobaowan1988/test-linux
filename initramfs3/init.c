@@ -613,7 +613,7 @@ int main(void)
         "kubectl","get","events","-A","--sort-by=.lastTimestamp",NULL});
 
     /* ── apply test resources ──────────────── */
-    kctl("CREATE test resources (ConfigMap/Secret/SA/Svc/Deployment/PDB/Job)",
+    kctl("CREATE test resources (all GVKs)",
         (const char*[]){"kubectl","apply","-f",
           "/etc/kubernetes/test-resources.yaml",NULL});
 
@@ -675,6 +675,32 @@ int main(void)
         if (done) { printf("  [ok] csi-consumer Running\n"); break; }
     }
 
+    /* wait up to 60s for DaemonSet pod to be Running */
+    printf("  waiting up to 60s for test-ds DaemonSet pod...\n");
+    for (int i = 0; i < 600; i++) {
+        msleep(100);
+        FILE *f = popen("kubectl get pods -A --no-headers 2>/dev/null", "r");
+        if (!f) continue;
+        char line[256]; int done = 0;
+        while (fgets(line, sizeof line, f))
+            if (strstr(line,"test-ds") && strstr(line,"Running")) { done=1; break; }
+        pclose(f);
+        if (done) { printf("  [ok] test-ds pod Running\n"); break; }
+    }
+
+    /* wait up to 60s for StatefulSet pod to be Running */
+    printf("  waiting up to 60s for test-sts StatefulSet pod...\n");
+    for (int i = 0; i < 600; i++) {
+        msleep(100);
+        FILE *f = popen("kubectl get pods -A --no-headers 2>/dev/null", "r");
+        if (!f) continue;
+        char line[256]; int done = 0;
+        while (fgets(line, sizeof line, f))
+            if (strstr(line,"test-sts") && strstr(line,"Running")) { done=1; break; }
+        pclose(f);
+        if (done) { printf("  [ok] test-sts pod Running\n"); break; }
+    }
+
     /* ── CSI / Storage / Ingress resources (after create) ── */
     kctl("storage » csidrivers", (const char*[]){
         "kubectl","get","csidrivers",NULL});
@@ -690,6 +716,26 @@ int main(void)
         "kubectl","get","ingressclasses",NULL});
     kctl("networking » ingresses", (const char*[]){
         "kubectl","get","ingresses","-A",NULL});
+    kctl("discovery.k8s.io/v1 » endpointslices -A", (const char*[]){
+        "kubectl","get","endpointslices","-A",NULL});
+    kctl("node.k8s.io/v1 » runtimeclasses", (const char*[]){
+        "kubectl","get","runtimeclasses",NULL});
+    kctl("rbac/v1 » clusterroles", (const char*[]){
+        "kubectl","get","clusterroles",NULL});
+    kctl("rbac/v1 » clusterrolebindings", (const char*[]){
+        "kubectl","get","clusterrolebindings",NULL});
+    kctl("rbac/v1 » roles -A", (const char*[]){
+        "kubectl","get","roles","-A",NULL});
+    kctl("rbac/v1 » rolebindings -A", (const char*[]){
+        "kubectl","get","rolebindings","-A",NULL});
+    kctl("networking.k8s.io/v1 » networkpolicies -A", (const char*[]){
+        "kubectl","get","networkpolicies","-A",NULL});
+    kctl("core/v1 » resourcequotas -A", (const char*[]){
+        "kubectl","get","resourcequotas","-A",NULL});
+    kctl("core/v1 » limitranges -A", (const char*[]){
+        "kubectl","get","limitranges","-A",NULL});
+    kctl("apiextensions/v1 » customresourcedefinitions", (const char*[]){
+        "kubectl","get","customresourcedefinitions",NULL});
 
     /* dump iptables OUTPUT chain — needed for locally-originated ClusterIP traffic */
     printf("\n── iptables nat OUTPUT chain ────────────────────────\n");
@@ -809,6 +855,14 @@ int main(void)
     kctl("batch/v1 » cronjobs -A", (const char*[]){
         "kubectl","get","cronjobs","-A",NULL});
 
+    /* ── discovery.k8s.io/v1 ────────────────── */
+    kctl("discovery.k8s.io/v1 » endpointslices -A", (const char*[]){
+        "kubectl","get","endpointslices","-A",NULL});
+
+    /* ── node.k8s.io/v1 ─────────────────────── */
+    kctl("node.k8s.io/v1 » runtimeclasses", (const char*[]){
+        "kubectl","get","runtimeclasses",NULL});
+
     /* ── networking.k8s.io/v1 ────────────────── */
     kctl("networking.k8s.io/v1 » ingresses -A", (const char*[]){
         "kubectl","get","ingresses","-A",NULL});
@@ -828,10 +882,10 @@ int main(void)
         "kubectl","get","volumeattachments",NULL});
 
     /* ── rbac.authorization.k8s.io/v1 ───────── */
-    kctl("rbac/v1 » clusterroles (count)", (const char*[]){
-        "kubectl","get","clusterroles","--no-headers",NULL});
+    kctl("rbac/v1 » clusterroles", (const char*[]){
+        "kubectl","get","clusterroles",NULL});
     kctl("rbac/v1 » clusterrolebindings", (const char*[]){
-        "kubectl","get","clusterrolebindings","--no-headers",NULL});
+        "kubectl","get","clusterrolebindings",NULL});
     kctl("rbac/v1 » roles -A", (const char*[]){
         "kubectl","get","roles","-A",NULL});
     kctl("rbac/v1 » rolebindings -A", (const char*[]){
@@ -862,6 +916,22 @@ int main(void)
     /* ── apiextensions.k8s.io/v1 ─────────────── */
     kctl("apiextensions/v1 » customresourcedefinitions", (const char*[]){
         "kubectl","get","customresourcedefinitions",NULL});
+
+    /* ── core/v1 post-create ─────────────────── */
+    kctl("core/v1 » resourcequotas -A", (const char*[]){
+        "kubectl","get","resourcequotas","-A",NULL});
+    kctl("core/v1 » limitranges -A", (const char*[]){
+        "kubectl","get","limitranges","-A",NULL});
+    kctl("core/v1 » secrets -A", (const char*[]){
+        "kubectl","get","secrets","-A",NULL});
+    kctl("core/v1 » configmaps -A", (const char*[]){
+        "kubectl","get","configmaps","-A",NULL});
+    kctl("core/v1 » serviceaccounts -A", (const char*[]){
+        "kubectl","get","serviceaccounts","-A",NULL});
+    kctl("core/v1 » services -A", (const char*[]){
+        "kubectl","get","services","-A",NULL});
+    kctl("core/v1 » endpoints -A", (const char*[]){
+        "kubectl","get","endpoints","-A",NULL});
 
     /* ── final pod state ─────────────────────── */
     kctl("FINAL: pods -A -o wide", (const char*[]){

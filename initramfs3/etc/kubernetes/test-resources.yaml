@@ -186,3 +186,229 @@ spec:
         securityContext:
           seccompProfile:
             type: Unconfined
+---
+# CronJob — tests batch/v1 CronJob GVK
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: test-cronjob
+  namespace: default
+spec:
+  schedule: "*/30 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+          containers:
+          - name: job
+            image: docker.io/library/hello:latest
+            command: ["/bin/echo", "cron-tick"]
+            imagePullPolicy: Never
+            securityContext:
+              seccompProfile:
+                type: Unconfined
+---
+# DaemonSet — tests apps/v1 DaemonSet GVK (1 pod on test-node)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: test-ds
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: test-ds
+  template:
+    metadata:
+      labels:
+        app: test-ds
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      containers:
+      - name: hello
+        image: docker.io/library/hello:latest
+        command: ["/bin/sleep", "300"]
+        imagePullPolicy: Never
+        securityContext:
+          seccompProfile:
+            type: Unconfined
+---
+# Headless Service required by StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-sts-svc
+  namespace: default
+spec:
+  selector:
+    app: test-sts
+  clusterIP: None
+  ports:
+  - port: 80
+---
+# StatefulSet — tests apps/v1 StatefulSet GVK
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-sts
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: test-sts
+  serviceName: test-sts-svc
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: test-sts
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      containers:
+      - name: hello
+        image: docker.io/library/hello:latest
+        command: ["/bin/sleep", "300"]
+        imagePullPolicy: Never
+        securityContext:
+          seccompProfile:
+            type: Unconfined
+---
+# NetworkPolicy — tests networking.k8s.io/v1 NetworkPolicy GVK
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-netpol
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: hello-deploy
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - port: 8080
+---
+# ResourceQuota — tests core/v1 ResourceQuota GVK
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test-quota
+  namespace: default
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+---
+# LimitRange — tests core/v1 LimitRange GVK
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: test-limits
+  namespace: default
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 200m
+      memory: 128Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 64Mi
+---
+# ClusterRole — tests rbac.authorization.k8s.io/v1 ClusterRole GVK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+# ClusterRoleBinding — tests rbac.authorization.k8s.io/v1 ClusterRoleBinding GVK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: test-pod-reader-binding
+subjects:
+- kind: ServiceAccount
+  name: test-sa
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: test-pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# Role — tests rbac.authorization.k8s.io/v1 Role GVK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: test-cm-reader
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+---
+# RoleBinding — tests rbac.authorization.k8s.io/v1 RoleBinding GVK
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-cm-reader-binding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: test-sa
+  namespace: default
+roleRef:
+  kind: Role
+  name: test-cm-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# RuntimeClass — tests node.k8s.io/v1 RuntimeClass GVK
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: test-runc
+handler: runc
+---
+# CustomResourceDefinition — tests apiextensions.k8s.io/v1 CRD GVK
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: foos.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: foos
+    singular: foo
+    kind: Foo
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              message:
+                type: string
