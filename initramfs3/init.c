@@ -96,6 +96,18 @@ static void tail_file(const char *path, int nbytes) {
     close(fd);
 }
 
+/* run kubectl command with header; argv must be NULL-terminated */
+static void kctl(const char *header, const char *const argv[]) {
+    if (header) printf("\n── %-44s\n", header);
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        execv("/bin/kubectl", (char *const *)argv);
+        _exit(1);
+    }
+    int st; waitpid(p, &st, 0);
+}
+
 int main(void)
 {
     int fd = open("/dev/console", O_RDWR);
@@ -442,6 +454,140 @@ int main(void)
         fclose(f);
         if (done) { printf("  container started!\n"); msleep(8000); break; }
     }
+
+    /* ── kubectl GVK comprehensive test ─────────────────── */
+    setenv("KUBECONFIG", "/etc/kubernetes/admin.kubeconfig", 1);
+    printf("\n\n╔══════════════════════════════════════════════╗\n");
+    printf(    "║          kubectl GVK Test Suite              ║\n");
+    printf(    "╚══════════════════════════════════════════════╝\n");
+
+    /* 1. All available API resources (GVKs) */
+    kctl("api-resources (all GVKs)", (const char*[]){
+        "kubectl","api-resources","--verbs=list","-o","wide","--sort-by=kind",NULL});
+
+    /* 2. API versions */
+    kctl("api-versions", (const char*[]){
+        "kubectl","api-versions",NULL});
+
+    /* ── core/v1 ─────────────────────────────── */
+    kctl("core/v1 » nodes -o wide", (const char*[]){
+        "kubectl","get","nodes","-o","wide",NULL});
+    kctl("core/v1 » pods -A -o wide", (const char*[]){
+        "kubectl","get","pods","-A","-o","wide",NULL});
+    kctl("core/v1 » namespaces", (const char*[]){
+        "kubectl","get","namespaces",NULL});
+    kctl("core/v1 » services -A", (const char*[]){
+        "kubectl","get","services","-A",NULL});
+    kctl("core/v1 » endpoints -A", (const char*[]){
+        "kubectl","get","endpoints","-A",NULL});
+    kctl("core/v1 » configmaps -A", (const char*[]){
+        "kubectl","get","configmaps","-A",NULL});
+    kctl("core/v1 » secrets -A", (const char*[]){
+        "kubectl","get","secrets","-A",NULL});
+    kctl("core/v1 » serviceaccounts -A", (const char*[]){
+        "kubectl","get","serviceaccounts","-A",NULL});
+    kctl("core/v1 » persistentvolumes", (const char*[]){
+        "kubectl","get","persistentvolumes",NULL});
+    kctl("core/v1 » persistentvolumeclaims -A", (const char*[]){
+        "kubectl","get","persistentvolumeclaims","-A",NULL});
+    kctl("core/v1 » resourcequotas -A", (const char*[]){
+        "kubectl","get","resourcequotas","-A",NULL});
+    kctl("core/v1 » limitranges -A", (const char*[]){
+        "kubectl","get","limitranges","-A",NULL});
+    kctl("core/v1 » events -A (latest 20)", (const char*[]){
+        "kubectl","get","events","-A","--sort-by=.lastTimestamp",NULL});
+
+    /* ── apply test resources ──────────────── */
+    kctl("CREATE test resources (ConfigMap/Secret/SA/Svc/Deployment/PDB/Job)",
+        (const char*[]){"kubectl","apply","-f",
+          "/etc/kubernetes/test-resources.yaml",NULL});
+
+    /* wait up to 90s for Deployment pod to be Running */
+    printf("\n  waiting up to 90s for hello-deploy pod...\n");
+    for (int i = 0; i < 900; i++) {
+        msleep(100);
+        FILE *f = popen("kubectl get pods -A --no-headers 2>/dev/null", "r");
+        if (!f) continue;
+        char line[256]; int done = 0;
+        while (fgets(line, sizeof line, f))
+            if (strstr(line,"hello-deploy") && strstr(line,"Running")) { done=1; break; }
+        pclose(f);
+        if (done) { printf("  [ok] hello-deploy pod Running\n"); break; }
+    }
+
+    /* ── apps/v1 ─────────────────────────────── */
+    kctl("apps/v1 » deployments -A", (const char*[]){
+        "kubectl","get","deployments","-A","-o","wide",NULL});
+    kctl("apps/v1 » replicasets -A", (const char*[]){
+        "kubectl","get","replicasets","-A",NULL});
+    kctl("apps/v1 » daemonsets -A", (const char*[]){
+        "kubectl","get","daemonsets","-A",NULL});
+    kctl("apps/v1 » statefulsets -A", (const char*[]){
+        "kubectl","get","statefulsets","-A",NULL});
+
+    /* ── batch/v1 ────────────────────────────── */
+    kctl("batch/v1 » jobs -A", (const char*[]){
+        "kubectl","get","jobs","-A","-o","wide",NULL});
+    kctl("batch/v1 » cronjobs -A", (const char*[]){
+        "kubectl","get","cronjobs","-A",NULL});
+
+    /* ── networking.k8s.io/v1 ────────────────── */
+    kctl("networking.k8s.io/v1 » ingresses -A", (const char*[]){
+        "kubectl","get","ingresses","-A",NULL});
+    kctl("networking.k8s.io/v1 » ingressclasses", (const char*[]){
+        "kubectl","get","ingressclasses",NULL});
+    kctl("networking.k8s.io/v1 » networkpolicies -A", (const char*[]){
+        "kubectl","get","networkpolicies","-A",NULL});
+
+    /* ── storage.k8s.io/v1 ───────────────────── */
+    kctl("storage.k8s.io/v1 » storageclasses", (const char*[]){
+        "kubectl","get","storageclasses",NULL});
+    kctl("storage.k8s.io/v1 » csidrivers", (const char*[]){
+        "kubectl","get","csidrivers",NULL});
+    kctl("storage.k8s.io/v1 » csinodes", (const char*[]){
+        "kubectl","get","csinodes",NULL});
+    kctl("storage.k8s.io/v1 » volumeattachments", (const char*[]){
+        "kubectl","get","volumeattachments",NULL});
+
+    /* ── rbac.authorization.k8s.io/v1 ───────── */
+    kctl("rbac/v1 » clusterroles (count)", (const char*[]){
+        "kubectl","get","clusterroles","--no-headers",NULL});
+    kctl("rbac/v1 » clusterrolebindings", (const char*[]){
+        "kubectl","get","clusterrolebindings","--no-headers",NULL});
+    kctl("rbac/v1 » roles -A", (const char*[]){
+        "kubectl","get","roles","-A",NULL});
+    kctl("rbac/v1 » rolebindings -A", (const char*[]){
+        "kubectl","get","rolebindings","-A",NULL});
+
+    /* ── policy/v1 ───────────────────────────── */
+    kctl("policy/v1 » poddisruptionbudgets -A", (const char*[]){
+        "kubectl","get","poddisruptionbudgets","-A",NULL});
+
+    /* ── autoscaling/v2 ──────────────────────── */
+    kctl("autoscaling/v2 » horizontalpodautoscalers -A", (const char*[]){
+        "kubectl","get","horizontalpodautoscalers","-A",NULL});
+
+    /* ── scheduling.k8s.io/v1 ────────────────── */
+    kctl("scheduling.k8s.io/v1 » priorityclasses", (const char*[]){
+        "kubectl","get","priorityclasses",NULL});
+
+    /* ── coordination.k8s.io/v1 ─────────────── */
+    kctl("coordination.k8s.io/v1 » leases -A", (const char*[]){
+        "kubectl","get","leases","-A",NULL});
+
+    /* ── admissionregistration.k8s.io/v1 ────── */
+    kctl("admissionreg/v1 » mutatingwebhookconfigurations", (const char*[]){
+        "kubectl","get","mutatingwebhookconfigurations",NULL});
+    kctl("admissionreg/v1 » validatingwebhookconfigurations", (const char*[]){
+        "kubectl","get","validatingwebhookconfigurations",NULL});
+
+    /* ── apiextensions.k8s.io/v1 ─────────────── */
+    kctl("apiextensions/v1 » customresourcedefinitions", (const char*[]){
+        "kubectl","get","customresourcedefinitions",NULL});
+
+    /* ── final pod state ─────────────────────── */
+    kctl("FINAL: pods -A -o wide", (const char*[]){
+        "kubectl","get","pods","-A","-o","wide",NULL});
 
     /* print first 8KB then last 8KB of kubelet log */
     printf("── kubelet log (first 8KB) ─────────────────────\n");
