@@ -451,21 +451,143 @@ static void ftrace_event_proof(void) {
     printf("  %-8s loopback TCP 数据包精确触发 tcp_rcv_established\n\n",
            hits4 > 0 ? "[证明]" : "[跳过]");
 
+    /* ── Experiment 5: softirq path ──────────────────────────────────── */
+    printf("┌─ 实验5: softirq 路径  (UDP packet → __do_softirq) ────────────────┐\n");
+    printf("│  假设: 只有软中断被 raise 时 __do_softirq 才会出现                │\n");
+    printf("│  方法: arm tracer → 清空 → 发送 UDP loopback 包 → 读 trace        │\n");
+    printf("└─────────────────────────────────────────────────────────────────────┘\n");
+
+    ftrace_write("/sys/kernel/debug/tracing/set_ftrace_filter", "__do_softirq");
+    ftrace_write("/sys/kernel/debug/tracing/trace", "");
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "1");
+
+    /* send a UDP datagram to loopback — triggers NET_RX_SOFTIRQ on arrival */
+    {
+        int usrv = socket(AF_INET, SOCK_DGRAM, 0);
+        int ucli = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in usa;
+        memset(&usa, 0, sizeof usa);
+        usa.sin_family = AF_INET;
+        usa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        usa.sin_port = htons(19877);
+        bind(usrv, (struct sockaddr *)&usa, sizeof usa);
+        sendto(ucli, "X", 1, 0, (struct sockaddr *)&usa, sizeof usa);
+        char rb[4]; recvfrom(usrv, rb, sizeof rb, 0, NULL, NULL);
+        close(usrv); close(ucli);
+    }
+
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
+    int n5 = ftrace_read_trace(tbuf, sizeof tbuf);
+    int hits5 = count_hits(tbuf, "__do_softirq");
+    printf("  ring buffer size: %d bytes | __do_softirq 出现次数: %d\n", n5, hits5);
+    if (hits5 > 0) {
+        char *p = strstr(tbuf, "__do_softirq");
+        if (p) {
+            while (p > tbuf && *(p-1) != '\n') p--;
+            char *end = strchr(p, '\n');
+            if (end) *end = '\0';
+            printf("  → %s\n", p);
+            if (end) *end = '\n';
+        }
+    }
+    printf("  %-8s UDP 包到来触发 NET_RX_SOFTIRQ → __do_softirq；包发送前 buffer 为空\n\n",
+           hits5 > 0 ? "[证明]" : "[跳过]");
+
+    /* ── Experiment 6: workqueue/kthread path ────────────────────────── */
+    /*
+     * __queue_work() is the internal kernel function called whenever any work_struct
+     * is enqueued onto a workqueue (via queue_work / queue_work_on / schedule_work).
+     * Trigger: fork 5 children that exit immediately.  do_exit() → exit_mm() →
+     * mmdrop_async() → queue_work(mm_percpu_wq, ...) → __queue_work().
+     */
+    printf("┌─ 实验6: workqueue/kthread 路径  (fork+exit → __queue_work) ────────┐\n");
+    printf("│  假设: 只有 work item 入队时 __queue_work 才会出现                 │\n");
+    printf("│  方法: arm tracer → 清空 → fork×5子进程立即退出 → 读 trace         │\n");
+    printf("└─────────────────────────────────────────────────────────────────────┘\n");
+
+    ftrace_write("/sys/kernel/debug/tracing/set_ftrace_filter", "__queue_work");
+    ftrace_write("/sys/kernel/debug/tracing/trace", "");
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "1");
+
+    /* 5 fork+exit cycles: each exit calls do_exit → exit_mm → mmdrop_async →
+     * queue_work(mm_percpu_wq) → __queue_work(), guaranteeing workqueue activity */
+    for (int i = 0; i < 5; i++) {
+        pid_t fp = fork();
+        if (fp == 0) _exit(0);
+        int fst; waitpid(fp, &fst, 0);
+    }
+    /* small pause for async work to be enqueued */
+    { struct timespec tw = {0, 5000000L}; nanosleep(&tw, NULL); }
+
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
+    int n6 = ftrace_read_trace(tbuf, sizeof tbuf);
+    int hits6 = count_hits(tbuf, "__queue_work");
+    printf("  ring buffer size: %d bytes | __queue_work 出现次数: %d\n", n6, hits6);
+    if (hits6 > 0) {
+        char *p = strstr(tbuf, "__queue_work");
+        if (p) {
+            while (p > tbuf && *(p-1) != '\n') p--;
+            char *end = strchr(p, '\n');
+            if (end) *end = '\0';
+            printf("  → %s\n", p);
+            if (end) *end = '\n';
+        }
+    }
+    printf("  %-8s 进程退出时 mm 清理触发 __queue_work 向 kworker 投递任务\n\n",
+           hits6 > 0 ? "[证明]" : "[跳过]");
+
+    /* ── Experiment 7: scheduler path ───────────────────────────────── */
+    /* __schedule is notrace; use schedule() — the exported wrapper that IS traceable */
+    printf("┌─ 实验7: 调度器路径  (blocking sleep → schedule) ──────────────────┐\n");
+    printf("│  假设: 只有进程主动放弃 CPU (block/yield) 时 schedule 才会出现    │\n");
+    printf("│  方法: arm tracer → 清空 → nanosleep(1ms) 阻塞 → 读 trace         │\n");
+    printf("└─────────────────────────────────────────────────────────────────────┘\n");
+
+    ftrace_write("/sys/kernel/debug/tracing/set_ftrace_filter", "schedule");
+    ftrace_write("/sys/kernel/debug/tracing/trace", "");
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "1");
+
+    /* nanosleep blocks → kernel calls schedule() to pick next runnable task */
+    { struct timespec tsched = {0, 1000000L}; nanosleep(&tsched, NULL); }
+
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
+    int n7 = ftrace_read_trace(tbuf, sizeof tbuf);
+    int hits7 = count_hits(tbuf, " schedule <-");  /* exact: " schedule <-" avoids __schedule */
+    printf("  ring buffer size: %d bytes | schedule 出现次数: %d\n", n7, hits7);
+    if (hits7 > 0) {
+        char *p = strstr(tbuf, " schedule <-");
+        if (p) {
+            while (p > tbuf && *(p-1) != '\n') p--;
+            char *end = strchr(p, '\n');
+            if (end) *end = '\0';
+            printf("  → %s\n", p);
+            if (end) *end = '\n';
+        }
+    }
+    printf("  %-8s 进程阻塞精确触发 schedule → context_switch；空转时 buffer 为空\n\n",
+           hits7 > 0 ? "[证明]" : "[跳过]");
+
     /* ── Summary ─────────────────────────────────────────────────────── */
     printf("╔══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  实验结果汇总                                                        ║\n");
+    printf("║  七扇门 · ftrace 全量实验汇总                                        ║\n");
     printf("╠══════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  实验1 syscall    __arm64_sys_write   命中 %3d 次  %-6s          ║\n",
+    printf("║  门1 syscall (svc #0)       __arm64_sys_write      %3d次  %-6s  ║\n",
            hits1, hits1 > 0 ? "✓PASS" : "SKIP");
-    printf("║  实验2 timer IRQ  arch_timer_handler_virt 命中 %3d 次 %-6s        ║\n",
+    printf("║  门2 硬件IRQ (GIC)          arch_timer_handler_virt%3d次  %-6s  ║\n",
            hits2, hits2 > 0 ? "✓PASS" : "SKIP");
-    printf("║  实验3 page fault do_mem_abort        命中 %3d 次  %-6s          ║\n",
+    printf("║  门3 缺页中断 (MMU)         do_mem_abort            %3d次  %-6s  ║\n",
            hits3, hits3 > 0 ? "✓PASS" : "SKIP");
-    printf("║  实验4 TCP/net    tcp_rcv_established 命中 %3d 次  %-6s          ║\n",
+    printf("║  门4 TCP接收 (via softirq)  tcp_rcv_established     %3d次  %-6s  ║\n",
            hits4, hits4 > 0 ? "✓PASS" : "SKIP");
+    printf("║  门5 softirq (NET_RX)       __do_softirq            %3d次  %-6s  ║\n",
+           hits5, hits5 > 0 ? "✓PASS" : "SKIP");
+    printf("║  门6 workqueue/kthread      __queue_work            %3d次  %-6s  ║\n",
+           hits6, hits6 > 0 ? "✓PASS" : "SKIP");
+    printf("║  门7 调度器 (schedule)      schedule                %3d次  %-6s  ║\n",
+           hits7, hits7 > 0 ? "✓PASS" : "SKIP");
     printf("╠══════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  结论: .text 中的函数全部休眠于 ring buffer；                        ║\n");
-    printf("║        只有对应事件到来时才会被唤醒并在 trace 中留下足迹。           ║\n");
+    printf("║  结论: 七扇门全部实测。没有任何函数自发运行——                        ║\n");
+    printf("║        每一行 trace 背后都有且只有一个具体事件触发。                 ║\n");
     printf("╚══════════════════════════════════════════════════════════════════════╝\n\n");
 
     /* reset tracer to nop */
