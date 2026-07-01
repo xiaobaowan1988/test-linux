@@ -864,6 +864,413 @@ static void ftrace_family_proof(void) {
     ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ *  FTRACE PLAN EXECUTION ENGINE
+ *  Reads function groups from /ftrace-data/GRP_*.txt,
+ *  arms ftrace with the whole group in one write, runs a trigger,
+ *  then reports which functions actually fired.
+ * ═══════════════════════════════════════════════════════════════════════ */
+#define PLAN_MAXFUNCS   5000
+#define PLAN_NAMEBUF_SZ (320*1024)
+#define PLAN_TRACE_SZ   (4*1024*1024)
+
+static char       plan_namebuf[PLAN_NAMEBUF_SZ];
+static const char *plan_fnptrs[PLAN_MAXFUNCS];
+static int        plan_nfuncs;
+
+/* Load names from file into plan_fnptrs[] for hit detection (does NOT touch filter) */
+static int plan_load_names(const char *fpath) {
+    int fd = open(fpath, O_RDONLY);
+    if (fd < 0) { printf("  (cannot open %s)\n", fpath); return 0; }
+    int len = read(fd, plan_namebuf, PLAN_NAMEBUF_SZ - 1);
+    close(fd);
+    if (len <= 0) return 0;
+    plan_namebuf[len] = '\0';
+    plan_nfuncs = 0;
+    char *p = plan_namebuf, *end = plan_namebuf + len;
+    while (p < end && plan_nfuncs < PLAN_MAXFUNCS) {
+        char *eol = memchr(p, '\n', end - p);
+        if (eol) *eol = '\0';
+        if (*p) plan_fnptrs[plan_nfuncs++] = p;
+        p = eol ? eol + 1 : end;
+    }
+    return plan_nfuncs;
+}
+
+/* Set ftrace filter using glob PATTERNS (fast: one write per pattern).
+   Wildcards match many functions at once without per-name EINVAL overhead.
+   patterns[] is a NULL-terminated array of strings like "tcp_*", "inet_*". */
+static int plan_arm_patterns(const char * const patterns[]) {
+    int matched = 0;
+    /* First write opens with O_TRUNC to clear; subsequent writes use O_APPEND */
+    int first = 1;
+    for (int i = 0; patterns[i]; i++) {
+        int flags = first ? (O_WRONLY | O_TRUNC) : (O_WRONLY | O_APPEND);
+        int fd = open("/sys/kernel/debug/tracing/set_ftrace_filter", flags);
+        if (fd < 0) break;
+        const char *pat = patterns[i];
+        int plen = (int)strlen(pat);
+        /* Write pattern WITHOUT trailing newline; kernel processes on close */
+        ssize_t w = write(fd, pat, plen);
+        close(fd);
+        if (w > 0) { matched++; first = 0; }
+        else if (w < 0 && errno == EINVAL) { /* pattern matched nothing, ok */ }
+        else break;
+    }
+    return matched;
+}
+
+/* ── trigger implementations ──────────────────────────────────────── */
+static void ptrig_syscall(void) {
+    /* getpid() goes through vDSO and bypasses the kernel; use direct syscalls
+       to actually fire __arm64_sys_* handlers */
+    char buf[32];
+    int fd = open("/proc/version", O_RDONLY);    /* __arm64_sys_openat */
+    if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); }  /* read, close */
+    write(1, "\n", 1);                          /* __arm64_sys_write */
+    syscall(172);                               /* SYS_getpid - bypasses vDSO */
+    syscall(178);                               /* SYS_gettid */
+    syscall(174);                               /* SYS_getuid */
+    struct timespec ts = {0, 1}; nanosleep(&ts, NULL); /* __arm64_sys_nanosleep */
+}
+static void ptrig_file(void) {
+    char buf[128];
+    const char *paths[] = {"/proc/version", "/proc/filesystems",
+                            "/sys/firmware/devicetree/base/compatible",
+                            "/proc/cpuinfo", NULL};
+    for (int i = 0; paths[i]; i++) {
+        int fd = open(paths[i], O_RDONLY);
+        if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); }
+    }
+}
+static void ptrig_irq(void) {
+    struct timespec ts = {0, 15000000L}; nanosleep(&ts, NULL);
+}
+static void ptrig_fork(void) {
+    for (int i = 0; i < 4; i++) {
+        pid_t p = fork();
+        if (p == 0) _exit(0);
+        if (p > 0) { int s; waitpid(p, &s, 0); }
+    }
+}
+static void ptrig_rcu(void) {
+    for (int i = 0; i < 12; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) close(fd);
+    }
+}
+static void ptrig_mem(void) {
+    void *m = mmap(NULL, 256*1024, PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED) {
+        volatile char *p = (volatile char *)m;
+        for (int i = 0; i < 64; i++) p[i*4096] = (char)i;
+        munmap(m, 256*1024);
+    }
+    for (int i = 0; i < 4; i++) {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd >= 0) close(fd);
+    }
+}
+static void ptrig_sched(void) {
+    struct timespec ts = {0, 10000000L}; nanosleep(&ts, NULL);
+    pid_t p = fork(); if (p == 0) _exit(0);
+    if (p > 0) { int s; waitpid(p, &s, 0); }
+}
+static void ptrig_socket(void) {
+    /* TCP loopback */
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) { printf("  [DBG socket TCP] socket()=%d errno=%d\n",l,errno); goto udp; }
+    { int o=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&o,sizeof(o)); }
+    struct sockaddr_in a; memset(&a,0,sizeof(a));
+    a.sin_family=AF_INET; a.sin_port=htons(19877);
+    a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if (bind(l,(struct sockaddr*)&a,sizeof(a)) < 0) {
+        printf("  [DBG socket TCP] bind()=%d errno=%d\n",-1,errno);
+        close(l); goto udp;
+    }
+    listen(l, 1);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) {
+        int cr = connect(s, (struct sockaddr*)&a, sizeof(a));
+        int c = accept(l, NULL, NULL);
+        printf("  [DBG socket TCP] connect=%d accept=%d errno=%d\n",cr,c,errno);
+        char buf[64]="ftrace-plan";
+        send(s, buf, 11, 0);
+        if (c >= 0) { recv(c, buf, 64, 0); close(c); }
+        close(s);
+    }
+    close(l);
+udp:;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u >= 0) {
+        struct sockaddr_in ua; memset(&ua,0,sizeof(ua));
+        ua.sin_family=AF_INET; ua.sin_port=htons(19999);
+        ua.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        sendto(u,"x",1,0,(struct sockaddr*)&ua,sizeof(ua));
+        close(u);
+    }
+}
+static void ptrig_tty(void) {
+    int fd = open("/dev/ttyAMA0", O_WRONLY);
+    if (fd >= 0) { write(fd, "\n", 1); close(fd); }
+}
+static void ptrig_crypto(void) {
+    char buf[64]; int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) { read(fd,buf,sizeof buf); read(fd,buf,sizeof buf); close(fd); }
+}
+static void ptrig_bpf(void) {
+    /* BPF_PROG_LOAD: minimal 2-insn program (r0=0; exit) */
+    uint64_t insns[2]={0x00000000000000b7ULL,0x0000000000000095ULL};
+    const char *lic="GPL";
+    struct { uint32_t pt,ic; uint64_t ip,lp,pad[16]; } a;
+    memset(&a,0,sizeof(a)); a.pt=1; a.ic=2;
+    a.ip=(uint64_t)(uintptr_t)insns; a.lp=(uint64_t)(uintptr_t)lic;
+    int bfd=(int)syscall(280,5,&a,sizeof(a)); if(bfd>=0) close(bfd);
+    /* BPF_MAP_CREATE: array map */
+    struct { uint32_t mt,ks,vs,me; uint64_t pad[8]; } m;
+    memset(&m,0,sizeof(m)); m.mt=2; m.ks=4; m.vs=8; m.me=4;
+    int mfd=(int)syscall(280,0,&m,sizeof(m)); if(mfd>=0) close(mfd);
+}
+static void ptrig_trace(void) {
+    /* Read tracefs files → triggers tracefs VFS ops and trace seq file ops */
+    char buf[256];
+    const char *tfiles[] = {
+        "/sys/kernel/debug/tracing/available_tracers",
+        "/sys/kernel/debug/tracing/current_tracer",
+        "/sys/kernel/debug/tracing/tracing_on",
+        "/sys/kernel/debug/tracing/trace_options",
+        "/sys/kernel/debug/tracing/buffer_size_kb",
+        "/sys/kernel/debug/tracing/available_events",
+        NULL
+    };
+    for (int i = 0; tfiles[i]; i++) {
+        int fd = open(tfiles[i], O_RDONLY);
+        if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); }
+    }
+    /* Enable/disable a trace event to fire event enable path */
+    ftrace_write("/sys/kernel/debug/tracing/events/sched/sched_switch/enable","1");
+    struct timespec ts={0,10000000L}; nanosleep(&ts,NULL);
+    ftrace_write("/sys/kernel/debug/tracing/events/sched/sched_switch/enable","0");
+}
+static void ptrig_driver(void) {
+    char buf[256];
+    /* Read net device sysfs stats → dev_get_stats, dev_get_flags → dev_* hits */
+    const char *nfiles[] = {
+        "/sys/class/net/lo/statistics/rx_bytes",
+        "/sys/class/net/lo/statistics/tx_bytes",
+        "/sys/class/net/lo/statistics/rx_packets",
+        "/sys/class/net/lo/operstate",
+        "/sys/class/net/lo/mtu",
+        "/sys/class/net/lo/carrier",
+        NULL
+    };
+    for (int i = 0; nfiles[i]; i++) {
+        int fd = open(nfiles[i], O_RDONLY);
+        if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); }
+    }
+    /* List platform bus and devices → bus_for_each_dev, bus_find_device → bus_* */
+    DIR *d = opendir("/sys/bus/platform/devices");
+    if (d) {
+        struct dirent *de;
+        int cnt = 0;
+        while ((de = readdir(d)) && cnt < 16) {
+            if (de->d_name[0] != '.') {
+                char path[256];
+                snprintf(path, sizeof(path), "/sys/bus/platform/devices/%s/uevent", de->d_name);
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); cnt++; }
+            }
+        }
+        closedir(d);
+    }
+    /* Read power state → pm_* functions */
+    int fd = open("/sys/power/state", O_RDONLY);
+    if (fd >= 0) { read(fd, buf, sizeof buf); close(fd); }
+}
+
+/* ── run one group (tracer already active, filter set after tracer) ── */
+static void plan_run_group(const char *gname, void (*trigger)(void),
+                            const char *trigdesc,
+                            const char * const patterns[]) {
+    char fpath[64];
+    snprintf(fpath, sizeof(fpath), "/ftrace-data/GRP_%s.txt", gname);
+    printf("\n[EXEC:%-7s] ", gname); fflush(NULL);
+
+    /* Load exact names into plan_fnptrs[] for hit detection */
+    int n = plan_load_names(fpath);
+    if (n == 0) { printf("no functions loaded\n"); return; }
+
+    /* Set filter using GLOB PATTERNS (efficient: one write per pattern) */
+    plan_arm_patterns(patterns);
+
+    /* Count how many functions are actually in the filter */
+    int validated = 0;
+    {
+        int vfd = open("/sys/kernel/debug/tracing/set_ftrace_filter", O_RDONLY);
+        if (vfd >= 0) {
+            static char vbuf[4096];
+            int vlen;
+            while ((vlen = read(vfd, vbuf, sizeof(vbuf))) > 0)
+                for (int vi = 0; vi < vlen; vi++)
+                    if (vbuf[vi] == '\n') validated++;
+            close(vfd);
+        }
+    }
+    printf("armed=%d  validated=%d  trigger=%s\n", n, validated, trigdesc);
+
+    /* For very low validated counts, print which functions are actually in filter */
+    if (validated > 0 && validated <= 10) {
+        int vfd2 = open("/sys/kernel/debug/tracing/set_ftrace_filter", O_RDONLY);
+        if (vfd2 >= 0) {
+            static char vbuf2[1024];
+            int vlen2 = read(vfd2, vbuf2, sizeof(vbuf2)-1);
+            close(vfd2);
+            if (vlen2 > 0) { vbuf2[vlen2] = '\0'; printf("  [filter: %s]\n", vbuf2); }
+        }
+    }
+
+    ftrace_write("/sys/kernel/debug/tracing/trace", "");   /* clear buffer */
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "1");
+
+    trigger();
+
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
+
+    /* Read trace into heap buffer */
+    char *tbuf = malloc(PLAN_TRACE_SZ);
+    int tlen = 0;
+    if (tbuf) {
+        int fd = open("/sys/kernel/debug/tracing/trace", O_RDONLY);
+        if (fd >= 0) {
+            tlen = read(fd, tbuf, PLAN_TRACE_SZ - 1);
+            close(fd);
+        }
+        if (tlen < 0) tlen = 0;
+        tbuf[tlen] = '\0';
+    }
+
+    /* Count hits: search trace for ": funcname " */
+    int fired = 0, shown = 0;
+    char pat[256];
+    if (tbuf) {
+        for (int i = 0; i < n; i++) {
+            snprintf(pat, sizeof(pat), ": %s ", plan_fnptrs[i]);
+            if (strstr(tbuf, pat)) {
+                fired++;
+                if (shown < 8) { printf("  HIT %s\n", plan_fnptrs[i]); shown++; }
+            }
+        }
+    }
+    if (shown < fired) printf("  ... +%d more\n", fired - shown);
+    printf("  RESULT fired=%d/%d (%.0f%%)  trace=%dKB\n",
+           fired, n, n ? fired*100.0/n : 0.0, tlen/1024);
+
+    /* If nothing fired but trace has content, dump up to 10 unique function names from trace */
+    if (fired == 0 && tlen > 100 && tbuf) {
+        char seen[10][64]; int nseen = 0;
+        char *p = tbuf;
+        while (p && nseen < 10) {
+            char *colon = strstr(p, ": ");
+            if (!colon) break;
+            char *fn = colon + 2;
+            char *sp = strchr(fn, ' ');
+            if (!sp || sp == fn || sp - fn > 63) { p = colon + 2; continue; }
+            int flen = (int)(sp - fn);
+            int dup = 0;
+            for (int k = 0; k < nseen; k++)
+                if (strncmp(seen[k], fn, flen) == 0 && seen[k][flen] == 0) { dup=1; break; }
+            if (!dup) {
+                strncpy(seen[nseen], fn, flen); seen[nseen][flen] = 0;
+                printf("  [traced: %s]\n", seen[nseen]);
+                nseen++;
+            }
+            p = sp;
+        }
+    }
+
+    free(tbuf);
+    /* clear filter between groups (keeps tracer active) */
+    ftrace_write("/sys/kernel/debug/tracing/set_ftrace_filter", "");
+}
+
+/* Glob patterns for each group's set_ftrace_filter (must end with NULL).
+   Wildcards match all available traceable functions in the subsystem. */
+static const char *pat_syscall[] = { "__arm64_sys_*", NULL };
+static const char *pat_file[]    = { "file_*", "vfs_*", "inode_*", "dentry_*",
+                                     "do_sys_*", "path_*", "fd_*", NULL };
+static const char *pat_irq[]     = { "irq_*", "__irq_*", "gic_*", "arch_timer_*",
+                                     "tick_*", "handle_irq*", "do_irq*", NULL };
+static const char *pat_fork[]    = { "cgroup_fork*", "cgroup_post_fork*",
+                                     "copy_process*", "task_fork_*",
+                                     "sched_fork*", "wake_up_new_task*", NULL };
+static const char *pat_rcu[]     = { "rcu_*", "__rcu_*", "synchronize_rcu*",
+                                     "call_rcu*", "kfree_rcu*", NULL };
+static const char *pat_mem[]     = { "alloc_pages*", "__alloc_pages*",
+                                     "kmalloc*", "kfree*", "slab_*",
+                                     "vmalloc*", "vfree*", "memcg_*",
+                                     "__kmalloc*", "page_*", NULL };
+static const char *pat_sched[]   = { "schedule*", "__schedule*",
+                                     "wake_up_process*", "try_to_wake_up*",
+                                     "pick_next_task*", "mnt_put_*", NULL };
+static const char *pat_socket[]  = { "tcp_*", "inet_*", "sock_*", "udp_*",
+                                     "skb_*", "sk_*", "ip_*", "net_*", NULL };
+static const char *pat_tty[]     = { "tty_*", "n_tty_*", "pty_*",
+                                     "uart_*", "pl011_*", NULL };
+static const char *pat_crypto[]  = { "crng_*", "chacha_*", "blake2s*",
+                                     "get_random_*", "_get_random*",
+                                     "urandom_*", "random_*", NULL };
+static const char *pat_bpf[]     = { "bpf_*", "__bpf_*", "do_check*",
+                                     "btf_*", "map_*", NULL };
+static const char *pat_trace[]   = { "ftrace_*", "ring_buffer_*",
+                                     "trace_*", "tracing_*",
+                                     "perf_*", "event_*",
+                                     "tracefs_*", "seq_read*",
+                                     "trace_seq_*", "trace_event_*", NULL };
+static const char *pat_driver[]  = { "clk_*", "clkdev_*", "dev_*",
+                                     "devm_*", "platform_*", "driver_*",
+                                     "pm_*", "bus_*", NULL };
+
+static void ftrace_plan_exec(void) {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  FTRACE PLAN EXEC  13 groups / 11651 functions               ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    /* Activate function tracer ONCE; keep active across all groups */
+    ftrace_write("/sys/kernel/debug/tracing/buffer_size_kb", "4096");
+    ftrace_write("/sys/kernel/debug/tracing/current_tracer", "function");
+    ftrace_write("/sys/kernel/debug/tracing/tracing_on", "0");
+
+    struct {
+        const char *grp; void (*trig)(void);
+        const char *desc; const char * const *pats;
+    } G[] = {
+        {"SYSCALL", ptrig_syscall, "getpid()×5",                                   pat_syscall},
+        {"FILE",    ptrig_file,    "open+read /proc/version+/proc/filesystems+...", pat_file},
+        {"IRQ",     ptrig_irq,     "nanosleep 15ms",                               pat_irq},
+        {"FORK",    ptrig_fork,    "fork()×4 + waitpid",                           pat_fork},
+        {"RCU",     ptrig_rcu,     "socket open/close×12",                         pat_rcu},
+        {"MEM",     ptrig_mem,     "mmap 256KB anon + touch 64 pages + munmap",    pat_mem},
+        {"SCHED",   ptrig_sched,   "nanosleep 10ms + fork",                        pat_sched},
+        {"SOCKET",  ptrig_socket,  "TCP loopback connect+send + UDP sendto",       pat_socket},
+        {"TTY",     ptrig_tty,     "write /dev/ttyAMA0",                          pat_tty},
+        {"CRYPTO",  ptrig_crypto,  "read /dev/urandom×2",                         pat_crypto},
+        {"BPF",     ptrig_bpf,     "BPF_PROG_LOAD + BPF_MAP_CREATE",              pat_bpf},
+        {"TRACE",   ptrig_trace,   "enable sched_switch+softirq events + sleep",   pat_trace},
+        {"DRIVER",  ptrig_driver,  "read net/lo stats + platform device uevent",   pat_driver},
+        {NULL, NULL, NULL, NULL}
+    };
+    for (int i = 0; G[i].grp; i++)
+        plan_run_group(G[i].grp, G[i].trig, G[i].desc, G[i].pats);
+
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  FTRACE PLAN EXEC COMPLETE                                   ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    ftrace_write("/sys/kernel/debug/tracing/current_tracer", "nop");
+    ftrace_write("/sys/kernel/debug/tracing/set_ftrace_filter", "");
+    ftrace_write("/sys/kernel/debug/tracing/buffer_size_kb", "1408");
+}
+
 /* tail last N bytes of a file to stdout */
 static void tail_file(const char *path, int nbytes) {
     int fd = open(path, O_RDONLY);
@@ -939,6 +1346,11 @@ int main(void)
     add_svc_route();
     sethostname("test-node", 9);
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin", 1);
+
+    /* ── ftrace experiments (before K8s startup) ─────────── */
+    ftrace_event_proof();
+    ftrace_family_proof();
+    ftrace_plan_exec();
 
     /* ── etcd ────────────────────────────────────────────── */
     printf("\n[ etcd ]\n");
@@ -1775,9 +2187,6 @@ int main(void)
 
     /* ── /proc 进程账本 ──────────────────────────────────────── */
     proc_account(kl, "kubelet");
-
-    ftrace_event_proof();
-    ftrace_family_proof();
 
     printf("\n=== Done. Powering off. ===\n\n");
     sync();
